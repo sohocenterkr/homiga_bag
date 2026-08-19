@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>가방 360도 드래그 뷰어</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #111;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .viewer {
+    position: relative;
+    width: 100%;
+    max-width: 900px;
+    aspect-ratio: 16 / 9;
+    touch-action: pan-y; /* 세로 스크롤은 허용, 가로 제스처만 뷰어가 가로챔 */
+    cursor: grab;
+    user-select: none;
+    background: #111;
+  }
+  .viewer.dragging { cursor: grabbing; }
+  .viewer video { display: none; }
+  .viewer canvas {
+    width: 100%;
+    height: 100%;
+    object-fit: contain; /* 프레임이 바뀌어도 제품 위치·크기가 고정되어 보이도록 */
+    display: block;
+    pointer-events: none;
+  }
+  .hint {
+    position: absolute;
+    bottom: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: #fff;
+    font: 14px/1.4 sans-serif;
+    background: rgba(0,0,0,.5);
+    padding: 6px 14px;
+    border-radius: 20px;
+    pointer-events: none;
+    opacity: .85;
+    transition: opacity .3s;
+  }
+  .viewer.dragging .hint { opacity: 0; }
+  .loading {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    color: #fff;
+    font: 14px/1.4 sans-serif;
+    background: #111;
+  }
+  .loading .bar {
+    width: 200px;
+    height: 4px;
+    background: #333;
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .loading .bar-fill {
+    width: 0%;
+    height: 100%;
+    background: #fff;
+    transition: width .1s linear;
+  }
+</style>
+</head>
+<body>
+  <div class="viewer" id="viewer">
+    <video id="video" src="bag_360.mp4" preload="auto" playsinline muted></video>
+    <canvas id="canvas"></canvas>
+    <div class="hint" id="hint">좌우로 드래그하여 회전</div>
+    <div class="loading" id="loading">
+      <div>프레임을 준비하는 중...</div>
+      <div class="bar"><div class="bar-fill" id="barFill"></div></div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const viewer = document.getElementById('viewer');
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const loading = document.getElementById('loading');
+  const barFill = document.getElementById('barFill');
+  const hint = document.getElementById('hint');
+
+  // 회전 한 바퀴를 표현할 정지 프레임 수. 영상 길이(10초) 전체를 이 개수만큼
+  // 균등 샘플링해 미리 디코딩해두므로, 드래그 중에는 video seek이 전혀 발생하지 않는다.
+  const FRAME_COUNT = 80;
+  const MAX_WIDTH = 720; // 프레임 하나당 메모리 사용량 상한
+  // 뷰어 폭 전체를 드래그했을 때 몇 바퀴 회전할지. 1이면 풀 드래그 = 1회전.
+  const ROTATIONS_PER_WIDTH = 1;
+  // 드래그 방향과 회전 방향을 맞추기 위한 부호. 반대로 돌면 -1로 변경.
+  const DIRECTION = 1;
+
+  const frames = [];
+  let frameW = 0, frameH = 0;
+  let ready = false;
+
+  let dragging = false;
+  let startX = 0;
+  let startFrame = 0;
+  let targetFrame = 0;
+  let currentFrame = -1;
+  let rafId = null;
+
+  function wrapFrame(f) {
+    let r = f % FRAME_COUNT;
+    if (r < 0) r += FRAME_COUNT;
+    return r;
+  }
+
+  function drawFrame(idx) {
+    if (!frames[idx]) return;
+    ctx.clearRect(0, 0, frameW, frameH);
+    ctx.drawImage(frames[idx], 0, 0, frameW, frameH);
+    currentFrame = idx;
+  }
+
+  function seekTo(t) {
+    return new Promise((resolve) => {
+      const onSeeked = () => {
+        video.removeEventListener('seeked', onSeeked);
+        resolve();
+      };
+      video.addEventListener('seeked', onSeeked);
+      video.currentTime = t;
+    });
+  }
+
+  function waitFor(el, evt) {
+    return new Promise((resolve) => el.addEventListener(evt, resolve, { once: true }));
+  }
+
+  async function captureFrames() {
+    if (video.readyState < 1) await waitFor(video, 'loadedmetadata');
+    const duration = video.duration;
+    const scale = Math.min(1, MAX_WIDTH / video.videoWidth);
+    frameW = Math.round(video.videoWidth * scale);
+    frameH = Math.round(video.videoHeight * scale);
+    canvas.width = frameW;
+    canvas.height = frameH;
+
+    const off = document.createElement('canvas');
+    off.width = frameW;
+    off.height = frameH;
+    const octx = off.getContext('2d');
+
+    for (let i = 0; i < FRAME_COUNT; i++) {
+      const t = Math.min(duration - 0.001, (i / FRAME_COUNT) * duration);
+      await seekTo(t);
+      octx.drawImage(video, 0, 0, frameW, frameH);
+      frames[i] = await createImageBitmap(off);
+      barFill.style.width = `${Math.round(((i + 1) / FRAME_COUNT) * 100)}%`;
+      if (i === 0) drawFrame(0);
+    }
+
+    ready = true;
+    loading.style.display = 'none';
+  }
+
+  function getX(e) {
+    return e.touches ? e.touches[0].clientX : e.clientX;
+  }
+
+  function onDragStart(e) {
+    if (!ready) return;
+    dragging = true;
+    viewer.classList.add('dragging');
+    startX = getX(e);
+    startFrame = currentFrame;
+    targetFrame = currentFrame;
+    if (e.cancelable) e.preventDefault();
+    if (rafId === null) rafId = requestAnimationFrame(tick);
+  }
+
+  function onDragMove(e) {
+    if (!dragging) return;
+    const deltaX = getX(e) - startX;
+    const width = viewer.clientWidth || 1;
+    const deltaFrames = (deltaX / width) * FRAME_COUNT * ROTATIONS_PER_WIDTH * DIRECTION;
+    targetFrame = startFrame + deltaFrames;
+    if (e.cancelable) e.preventDefault();
+  }
+
+  function onDragEnd() {
+    if (!dragging) return;
+    dragging = false;
+    viewer.classList.remove('dragging');
+  }
+
+  // 입력 이벤트는 targetFrame만 갱신하고, 실제 캔버스 draw는 rAF에서만 수행해
+  // 포인터 이벤트 빈도와 렌더링 빈도를 분리한다. draw 자체가 사전 디코딩된
+  // 비트맵을 그리는 동기 작업이라 seek 지연 없이 매 프레임 즉시 반영된다.
+  function tick() {
+    const idx = Math.round(wrapFrame(targetFrame));
+    if (idx !== currentFrame) drawFrame(idx);
+    if (dragging) {
+      rafId = requestAnimationFrame(tick);
+    } else {
+      rafId = null;
+    }
+  }
+
+  viewer.addEventListener('mousedown', onDragStart);
+  window.addEventListener('mousemove', onDragMove);
+  window.addEventListener('mouseup', onDragEnd);
+
+  viewer.addEventListener('touchstart', onDragStart, { passive: false });
+  window.addEventListener('touchmove', onDragMove, { passive: false });
+  window.addEventListener('touchend', onDragEnd);
+  window.addEventListener('touchcancel', onDragEnd);
+
+  captureFrames();
+})();
+</script>
+</body>
+</html>
